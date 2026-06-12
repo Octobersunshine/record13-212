@@ -15,6 +15,7 @@ class Device:
     offline_time: Optional[datetime] = None
     last_alert_time: Optional[datetime] = None
     alert_count: int = 0
+    consecutive_miss_count: int = 0
     metadata: Dict[str, str] = field(default_factory=dict)
 
 
@@ -24,6 +25,7 @@ class AlertConfig:
     timeout_minutes: int = 5
     cooldown_minutes: int = 10
     max_alerts: int = 3
+    consecutive_misses: int = 3
 
 
 class HeartbeatService:
@@ -50,6 +52,7 @@ class HeartbeatService:
                 device.last_heartbeat = now
                 device.status = "online"
                 device.offline_time = None
+                device.consecutive_miss_count = 0
                 if was_offline:
                     device.alert_count = 0
                     device.last_alert_time = None
@@ -91,14 +94,20 @@ class HeartbeatService:
         offline_devices = []
         now = datetime.now()
         timeout_threshold = now - timedelta(minutes=self.alert_config.timeout_minutes)
+        miss_threshold = max(1, self.alert_config.consecutive_misses)
 
         with self._lock:
             for device in self.devices.values():
-                if device.status == "online" and device.last_heartbeat < timeout_threshold:
-                    device.status = "offline"
-                    device.offline_time = now
-                    offline_devices.append(device)
-                    self._send_alert(device, "offline")
+                if device.status == "online":
+                    if device.last_heartbeat < timeout_threshold:
+                        device.consecutive_miss_count += 1
+                        if device.consecutive_miss_count >= miss_threshold:
+                            device.status = "offline"
+                            device.offline_time = now
+                            offline_devices.append(device)
+                            self._send_alert(device, "offline")
+                    else:
+                        device.consecutive_miss_count = 0
                 elif device.status == "offline" and device.last_heartbeat < timeout_threshold:
                     if self._should_send_alert(device):
                         self._send_alert(device, "offline")
@@ -159,6 +168,7 @@ class HeartbeatService:
             "last_alert_time": device.last_alert_time.isoformat() if device.last_alert_time else None,
             "seconds_since_last_heartbeat": int((now - device.last_heartbeat).total_seconds()),
             "alert_count": device.alert_count,
+            "consecutive_miss_count": device.consecutive_miss_count,
             "metadata": device.metadata
         }
 

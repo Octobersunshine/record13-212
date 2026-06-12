@@ -1,5 +1,6 @@
 import unittest
 import time
+import random
 from datetime import datetime, timedelta
 from unittest.mock import patch, MagicMock
 from heartbeat_service import HeartbeatService, AlertConfig, Device, create_app
@@ -11,7 +12,8 @@ class TestHeartbeatService(unittest.TestCase):
         self.config = AlertConfig(
             timeout_minutes=1,
             cooldown_minutes=0,
-            max_alerts=3
+            max_alerts=3,
+            consecutive_misses=1
         )
         self.service = HeartbeatService(self.config)
 
@@ -193,6 +195,138 @@ class TestHeartbeatService(unittest.TestCase):
 
         offline_devices = self.service.get_all_devices("offline")
         self.assertEqual(len(offline_devices), 3)
+
+    def test_consecutive_misses_required(self):
+        self.config.consecutive_misses = 3
+        self.service.process_heartbeat("device_001")
+
+        device = self.service.devices["device_001"]
+        device.last_heartbeat = datetime.now() - timedelta(minutes=2)
+
+        self.service.check_timeouts()
+        self.assertEqual(device.consecutive_miss_count, 1)
+        self.assertEqual(device.status, "online")
+
+        self.service.check_timeouts()
+        self.assertEqual(device.consecutive_miss_count, 2)
+        self.assertEqual(device.status, "online")
+
+        self.service.check_timeouts()
+        self.assertEqual(device.consecutive_miss_count, 3)
+        self.assertEqual(device.status, "offline")
+
+    def test_single_miss_no_alert_with_consecutive_threshold(self):
+        self.config.consecutive_misses = 3
+        callback_called = []
+
+        def callback(device):
+            callback_called.append(device.device_id)
+
+        self.service.add_alert_callback(callback)
+        self.service.process_heartbeat("device_001")
+
+        device = self.service.devices["device_001"]
+        device.last_heartbeat = datetime.now() - timedelta(minutes=2)
+
+        self.service.check_timeouts()
+        self.assertEqual(len(callback_called), 0)
+        self.assertEqual(device.status, "online")
+
+    def test_miss_then_recovery(self):
+        self.config.consecutive_misses = 3
+        self.service.process_heartbeat("device_001")
+
+        device = self.service.devices["device_001"]
+        device.last_heartbeat = datetime.now() - timedelta(minutes=2)
+
+        self.service.check_timeouts()
+        self.assertEqual(device.consecutive_miss_count, 1)
+
+        self.service.process_heartbeat("device_001")
+        self.assertEqual(device.consecutive_miss_count, 0)
+
+        device.last_heartbeat = datetime.now() - timedelta(minutes=2)
+        self.service.check_timeouts()
+        self.assertEqual(device.consecutive_miss_count, 1)
+        self.assertEqual(device.status, "online")
+
+    def test_consecutive_miss_count_in_status(self):
+        self.config.consecutive_misses = 3
+        self.service.process_heartbeat("device_001")
+
+        device = self.service.devices["device_001"]
+        device.last_heartbeat = datetime.now() - timedelta(minutes=2)
+
+        self.service.check_timeouts()
+
+        status = self.service.get_device_status("device_001")
+        self.assertEqual(status["consecutive_miss_count"], 1)
+        self.assertEqual(status["status"], "online")
+
+    def test_consecutive_misses_reset_when_heartbeat_ok(self):
+        self.config.consecutive_misses = 3
+        self.service.process_heartbeat("device_001")
+
+        device = self.service.devices["device_001"]
+        device.last_heartbeat = datetime.now() - timedelta(minutes=2)
+
+        self.service.check_timeouts()
+        self.service.check_timeouts()
+        self.assertEqual(device.consecutive_miss_count, 2)
+
+        device.last_heartbeat = datetime.now()
+        self.service.check_timeouts()
+        self.assertEqual(device.consecutive_miss_count, 0)
+
+    def test_consecutive_misses_with_different_thresholds(self):
+        for threshold in [1, 2, 5]:
+            self.config.consecutive_misses = threshold
+            self.service.devices.clear()
+            self.service.process_heartbeat("device_001")
+
+            device = self.service.devices["device_001"]
+            device.last_heartbeat = datetime.now() - timedelta(minutes=2)
+
+            for i in range(threshold - 1):
+                self.service.check_timeouts()
+                self.assertEqual(device.status, "online")
+
+            self.service.check_timeouts()
+            self.assertEqual(device.status, "offline")
+
+    def test_network_jitter_simulation(self):
+        self.config.consecutive_misses = 3
+        callback_called = []
+
+        def callback(device):
+            callback_called.append(device.device_id)
+
+        self.service.add_alert_callback(callback)
+        self.service.process_heartbeat("device_001")
+
+        device = self.service.devices["device_001"]
+
+        pattern = [
+            "miss", "miss", "ok",
+            "miss", "ok", "miss",
+            "miss", "ok", "miss",
+            "miss", "ok", "miss",
+            "ok", "miss", "miss",
+            "ok"
+        ]
+
+        for action in pattern:
+            if action == "ok":
+                self.service.process_heartbeat("device_001")
+            else:
+                device.last_heartbeat = datetime.now() - timedelta(minutes=2)
+
+            self.service.check_timeouts()
+            device = self.service.devices["device_001"]
+
+        self.assertEqual(len(callback_called), 0)
+        self.assertEqual(device.status, "online")
+        self.assertLess(device.consecutive_miss_count, 3)
 
 
 class TestFlaskAPI(unittest.TestCase):
