@@ -16,6 +16,7 @@ class Device:
     last_alert_time: Optional[datetime] = None
     alert_count: int = 0
     consecutive_miss_count: int = 0
+    last_offline_duration: Optional[int] = None
     metadata: Dict[str, str] = field(default_factory=dict)
 
 
@@ -35,10 +36,14 @@ class HeartbeatService:
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._check_thread: Optional[threading.Thread] = None
-        self._alert_callbacks: List[Callable[[Device], None]] = []
+        self._alert_callbacks: List[Callable[[Device, Dict], None]] = []
+        self._recovery_callbacks: List[Callable[[Device, Dict], None]] = []
 
-    def add_alert_callback(self, callback: Callable[[Device], None]) -> None:
+    def add_alert_callback(self, callback: Callable[[Device, Dict], None]) -> None:
         self._alert_callbacks.append(callback)
+
+    def add_recovery_callback(self, callback: Callable[[Device, Dict], None]) -> None:
+        self._recovery_callbacks.append(callback)
 
     def process_heartbeat(self, device_id: str, metadata: Optional[Dict[str, str]] = None) -> Dict:
         if not device_id:
@@ -49,14 +54,19 @@ class HeartbeatService:
             if device_id in self.devices:
                 device = self.devices[device_id]
                 was_offline = device.status == "offline"
+                offline_start_time = device.offline_time if was_offline else None
+
                 device.last_heartbeat = now
                 device.status = "online"
                 device.offline_time = None
                 device.consecutive_miss_count = 0
+
                 if was_offline:
                     device.alert_count = 0
                     device.last_alert_time = None
-                    self._send_alert(device, "back_online")
+                    if offline_start_time:
+                        device.last_offline_duration = int((now - offline_start_time).total_seconds())
+                    self._send_alert(device, "back_online", offline_start_time=offline_start_time, recovery_time=now)
             else:
                 device = Device(
                     device_id=device_id,
@@ -124,7 +134,7 @@ class HeartbeatService:
         cooldown = timedelta(minutes=self.alert_config.cooldown_minutes)
         return datetime.now() >= device.last_alert_time + cooldown
 
-    def _send_alert(self, device: Device, alert_type: str) -> None:
+    def _send_alert(self, device: Device, alert_type: str, **kwargs) -> None:
         if alert_type == "offline":
             if device.alert_count >= self.alert_config.max_alerts:
                 return
@@ -132,15 +142,27 @@ class HeartbeatService:
             device.alert_count += 1
             device.last_alert_time = datetime.now()
 
+        now = datetime.now()
         alert_payload = {
             "type": alert_type,
             "device_id": device.device_id,
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": now.isoformat(),
             "last_heartbeat": device.last_heartbeat.isoformat(),
             "status": device.status,
             "alert_count": device.alert_count,
             "metadata": device.metadata
         }
+
+        if alert_type == "back_online":
+            offline_start = kwargs.get("offline_start_time")
+            recovery_time = kwargs.get("recovery_time", now)
+
+            alert_payload["recovery_time"] = recovery_time.isoformat()
+            if offline_start:
+                alert_payload["offline_start_time"] = offline_start.isoformat()
+                offline_duration = int((recovery_time - offline_start).total_seconds())
+                alert_payload["offline_duration_seconds"] = offline_duration
+                alert_payload["offline_duration"] = self._format_duration(offline_duration)
 
         if self.alert_config.webhook_url:
             try:
@@ -152,15 +174,39 @@ class HeartbeatService:
             except Exception:
                 pass
 
+        if alert_type == "back_online":
+            for callback in self._recovery_callbacks:
+                try:
+                    callback(device, alert_payload)
+                except Exception:
+                    pass
+
         for callback in self._alert_callbacks:
             try:
-                callback(device)
+                callback(device, alert_payload)
             except Exception:
                 pass
 
+    def _format_duration(self, seconds: int) -> str:
+        if seconds < 60:
+            return f"{seconds}秒"
+        elif seconds < 3600:
+            minutes = seconds // 60
+            secs = seconds % 60
+            return f"{minutes}分{secs}秒" if secs > 0 else f"{minutes}分钟"
+        else:
+            hours = seconds // 3600
+            minutes = (seconds % 3600) // 60
+            if hours < 24:
+                return f"{hours}小时{minutes}分" if minutes > 0 else f"{hours}小时"
+            else:
+                days = hours // 24
+                hours = hours % 24
+                return f"{days}天{hours}小时" if hours > 0 else f"{days}天"
+
     def _device_to_dict(self, device: Device) -> Dict:
         now = datetime.now()
-        return {
+        result = {
             "device_id": device.device_id,
             "status": device.status,
             "last_heartbeat": device.last_heartbeat.isoformat(),
@@ -169,8 +215,12 @@ class HeartbeatService:
             "seconds_since_last_heartbeat": int((now - device.last_heartbeat).total_seconds()),
             "alert_count": device.alert_count,
             "consecutive_miss_count": device.consecutive_miss_count,
+            "last_offline_duration_seconds": device.last_offline_duration,
             "metadata": device.metadata
         }
+        if device.last_offline_duration is not None:
+            result["last_offline_duration"] = self._format_duration(device.last_offline_duration)
+        return result
 
     def start_monitor(self, check_interval_seconds: int = 30) -> None:
         if self._check_thread and self._check_thread.is_alive():

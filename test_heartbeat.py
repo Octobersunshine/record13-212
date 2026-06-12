@@ -92,8 +92,8 @@ class TestHeartbeatService(unittest.TestCase):
     def test_alert_callback_triggered(self):
         callback_called = []
 
-        def callback(device):
-            callback_called.append(device.device_id)
+        def callback(device, payload):
+            callback_called.append((device.device_id, payload["type"]))
 
         self.service.add_alert_callback(callback)
         self.service.process_heartbeat("device_001")
@@ -103,7 +103,8 @@ class TestHeartbeatService(unittest.TestCase):
 
         self.service.check_timeouts()
         self.assertEqual(len(callback_called), 1)
-        self.assertEqual(callback_called[0], "device_001")
+        self.assertEqual(callback_called[0][0], "device_001")
+        self.assertEqual(callback_called[0][1], "offline")
 
     def test_alert_webhook_triggered(self):
         mock_response = MagicMock()
@@ -138,8 +139,8 @@ class TestHeartbeatService(unittest.TestCase):
     def test_device_comes_back_online(self):
         callback_events = []
 
-        def callback(device):
-            callback_events.append((device.device_id, device.status))
+        def callback(device, payload):
+            callback_events.append((device.device_id, payload["type"], payload))
 
         self.service.add_alert_callback(callback)
         self.service.process_heartbeat("device_001")
@@ -157,7 +158,11 @@ class TestHeartbeatService(unittest.TestCase):
         self.assertEqual(device.alert_count, 0)
         self.assertIsNone(device.offline_time)
         self.assertEqual(len(callback_events), 2)
-        self.assertEqual(callback_events[1][1], "online")
+        self.assertEqual(callback_events[1][1], "back_online")
+        self.assertIsNotNone(device.last_offline_duration)
+        self.assertIn("offline_duration_seconds", callback_events[1][2])
+        self.assertIn("offline_start_time", callback_events[1][2])
+        self.assertIn("recovery_time", callback_events[1][2])
 
     def test_monitor_thread(self):
         self.service.start_monitor(check_interval_seconds=0.1)
@@ -219,7 +224,7 @@ class TestHeartbeatService(unittest.TestCase):
         self.config.consecutive_misses = 3
         callback_called = []
 
-        def callback(device):
+        def callback(device, payload):
             callback_called.append(device.device_id)
 
         self.service.add_alert_callback(callback)
@@ -298,7 +303,7 @@ class TestHeartbeatService(unittest.TestCase):
         self.config.consecutive_misses = 3
         callback_called = []
 
-        def callback(device):
+        def callback(device, payload):
             callback_called.append(device.device_id)
 
         self.service.add_alert_callback(callback)
@@ -327,6 +332,120 @@ class TestHeartbeatService(unittest.TestCase):
         self.assertEqual(len(callback_called), 0)
         self.assertEqual(device.status, "online")
         self.assertLess(device.consecutive_miss_count, 3)
+
+    def test_recovery_callback_triggered(self):
+        recovery_events = []
+
+        def recovery_callback(device, payload):
+            recovery_events.append((device.device_id, payload))
+
+        self.service.add_recovery_callback(recovery_callback)
+        self.service.process_heartbeat("device_001")
+
+        device = self.service.devices["device_001"]
+        device.last_heartbeat = datetime.now() - timedelta(minutes=2)
+        self.service.check_timeouts()
+
+        self.assertEqual(device.status, "offline")
+        self.assertEqual(len(recovery_events), 0)
+
+        self.service.process_heartbeat("device_001")
+        self.assertEqual(len(recovery_events), 1)
+        self.assertEqual(recovery_events[0][0], "device_001")
+        self.assertEqual(recovery_events[0][1]["type"], "back_online")
+        self.assertIn("offline_duration_seconds", recovery_events[0][1])
+        self.assertIn("offline_duration", recovery_events[0][1])
+        self.assertIn("recovery_time", recovery_events[0][1])
+
+    def test_recovery_webhook_payload(self):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+
+        with patch('requests.post', return_value=mock_response) as mock_post:
+            self.config.webhook_url = "http://example.com/alert"
+            self.service.process_heartbeat("device_001")
+
+            device = self.service.devices["device_001"]
+            offline_time = datetime.now() - timedelta(minutes=2)
+            device.last_heartbeat = offline_time
+            device.offline_time = offline_time
+            device.status = "offline"
+            device.alert_count = 1
+
+            time.sleep(0.1)
+            self.service.process_heartbeat("device_001")
+
+            self.assertEqual(mock_post.call_count, 1)
+
+            recovery_call = mock_post.call_args_list[0]
+            self.assertEqual(recovery_call[0][0], "http://example.com/alert")
+            payload = recovery_call[1]["json"]
+            self.assertEqual(payload["type"], "back_online")
+            self.assertEqual(payload["status"], "online")
+            self.assertIn("offline_start_time", payload)
+            self.assertIn("recovery_time", payload)
+            self.assertIn("offline_duration_seconds", payload)
+            self.assertIn("offline_duration", payload)
+            self.assertGreater(payload["offline_duration_seconds"], 0)
+
+    def test_last_offline_duration_in_status(self):
+        self.service.process_heartbeat("device_001")
+        device = self.service.devices["device_001"]
+
+        offline_time = datetime.now() - timedelta(minutes=2)
+        device.last_heartbeat = offline_time
+        device.offline_time = offline_time
+        device.status = "offline"
+
+        time.sleep(0.1)
+        self.service.process_heartbeat("device_001")
+
+        status = self.service.get_device_status("device_001")
+        self.assertIn("last_offline_duration_seconds", status)
+        self.assertIn("last_offline_duration", status)
+        self.assertIsNotNone(status["last_offline_duration_seconds"])
+        self.assertIsNotNone(status["last_offline_duration"])
+        self.assertGreater(status["last_offline_duration_seconds"], 0)
+
+    def test_format_duration(self):
+        self.assertEqual(self.service._format_duration(30), "30秒")
+        self.assertEqual(self.service._format_duration(60), "1分钟")
+        self.assertEqual(self.service._format_duration(90), "1分30秒")
+        self.assertEqual(self.service._format_duration(3600), "1小时")
+        self.assertEqual(self.service._format_duration(3660), "1小时1分")
+        self.assertEqual(self.service._format_duration(86400), "1天")
+        self.assertEqual(self.service._format_duration(90000), "1天1小时")
+
+    def test_multiple_recovery_events(self):
+        recovery_count = 0
+
+        def recovery_callback(device, payload):
+            nonlocal recovery_count
+            recovery_count += 1
+
+        self.service.add_recovery_callback(recovery_callback)
+        self.service.process_heartbeat("device_001")
+
+        for i in range(3):
+            device = self.service.devices["device_001"]
+            device.last_heartbeat = datetime.now() - timedelta(minutes=2)
+            self.service.check_timeouts()
+            self.assertEqual(device.status, "offline")
+
+            self.service.process_heartbeat("device_001")
+            self.assertEqual(device.status, "online")
+
+        self.assertEqual(recovery_count, 3)
+
+    def test_recovery_notification_for_new_device(self):
+        recovery_events = []
+
+        def recovery_callback(device, payload):
+            recovery_events.append(device.device_id)
+
+        self.service.add_recovery_callback(recovery_callback)
+        self.service.process_heartbeat("device_001")
+        self.assertEqual(len(recovery_events), 0)
 
 
 class TestFlaskAPI(unittest.TestCase):
